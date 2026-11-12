@@ -4,60 +4,44 @@
 #include <math.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-
 #include <Adafruit_ADS1X15.h>
 #include <Adafruit_VL53L0X.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-
 #include "landslide_model.h"
 
-// ==========================================
-// WIFI AND MQTT CONFIGURATION
-// ==========================================
+// =====================================
+// LANDSLIDEGUARD ESP32
+// SLOPE NORMAL RANGE: 50 TO 55 DEGREES
+// =====================================
 
-const char* WIFI_SSID = "Sidharth's S21FE 5G";
-const char* WIFI_PASSWORD = "sidhuyerra";
+// Enter your existing network credentials.
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
 const char* MQTT_HOST = "10.14.238.244";
 const uint16_t MQTT_PORT = 1884;
 const char* MQTT_USER = "landslideguard";
-const char* MQTT_PASSWORD = "Charan@2006";
+const char* MQTT_PASSWORD = "YOUR_MQTT_PASSWORD";
+const char* MQTT_TOPIC = "landslideguard/demo/station01";
 
-const char* MQTT_TOPIC =
-  "landslideguard/demo/station01";
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define LED_R 25
+#define LED_G 26
+#define LED_B 27
+#define BUZZER_PIN 33
 
-WiFiClient networkClient;
-PubSubClient mqttClient(networkClient);
+#define OLED_SCK 18
+#define OLED_MOSI 23
+#define OLED_CS 5
+#define OLED_DC 17
+#define OLED_RESET 16
 
-unsigned long lastWifiAttempt = 0;
-unsigned long lastMqttAttempt = 0;
-const unsigned long NETWORK_RETRY_MS = 5000;
-
-// ==========================================
-// LANDSLIDEGUARD ESP32 - EXHIBITION VERSION
-// Experimental prototype, not field validated
-// ==========================================
-
-#define SDA_PIN       21
-#define SCL_PIN       22
-
-#define LED_R         25
-#define LED_G         26
-#define LED_B         27
-#define BUZZER_PIN    33
-
-#define OLED_SCK      18
-#define OLED_MOSI     23
-#define OLED_CS        5
-#define OLED_DC       17
-#define OLED_RESET    16
-
-#define MPU_ADDR    0x68
+#define MPU_ADDR 0x68
 
 const bool BUZZER_ACTIVE_HIGH = true;
 
-// Calibrated moisture reference values
 const float DRY_ADC[3] = {
   15555.0f, 15697.0f, 15852.0f
 };
@@ -66,21 +50,21 @@ const float WET_ADC[3] = {
   4016.0f, 4458.0f, 4568.0f
 };
 
-// Minimum accepted RAW ADC reading: 1500
-// Below 1500 is treated as a possible signal fault.
 const int ADC_LOW_SIGNAL = 1500;
-const int ADC_MAX_VALID  = 32760;
+const int ADC_MAX_VALID = 32760;
 
-// Moisture alarm
-const float MOISTURE_ON  = 95.0f;
+const float MOISTURE_ON = 95.0f;
 const float MOISTURE_OFF = 90.0f;
 
 const int ALARM_CONFIRM_FRAMES = 3;
 const int RECOVERY_FRAMES = 3;
 
-// Movement thresholds
-const float TILT_WARNING_DEG = 3.0f;
-const float TILT_HIGH_DEG = 8.0f;
+// Physical slope reference.
+// Keep the slope at 52.5 degrees during startup.
+const float SLOPE_REST_DEG = 52.5f;
+const float SLOPE_NORMAL_MIN_DEG = 50.0f;
+const float SLOPE_NORMAL_MAX_DEG = 55.0f;
+const float SLOPE_HIGH_EXCESS_DEG = 5.0f;
 
 const float VIB_WARNING_G = 0.10f;
 const float VIB_HIGH_G = 0.25f;
@@ -88,10 +72,11 @@ const float VIB_HIGH_G = 0.25f;
 const unsigned long REPORT_INTERVAL = 1000;
 const unsigned long MPU_INTERVAL = 20;
 const unsigned long VIB_HOLD_TIME = 2000;
+const unsigned long NETWORK_RETRY_MS = 5000;
 
-// ==========================================
+// =====================================
 // SENSOR OBJECTS
-// ==========================================
+// =====================================
 
 Adafruit_ADS1115 ads;
 Adafruit_VL53L0X tof;
@@ -103,14 +88,17 @@ Adafruit_SSD1306 display(
 
 Eloquent::ML::Port::DecisionTree model;
 
+WiFiClient networkClient;
+PubSubClient mqttClient(networkClient);
+
 bool adsReady = false;
 bool mpuReady = false;
 bool tofReady = false;
 bool oledReady = false;
 
-// ==========================================
+// =====================================
 // MOISTURE VARIABLES
-// ==========================================
+// =====================================
 
 float rawADC[3] = {NAN, NAN, NAN};
 float filteredADC[3] = {NAN, NAN, NAN};
@@ -129,14 +117,15 @@ bool moistureAlarm = false;
 int goodFrames = 0;
 int wetFrames = 0;
 
-// ==========================================
-// MPU VARIABLES
-// ==========================================
+// =====================================
+// MPU6050 VARIABLES
+// =====================================
 
 float baselineTilt = 0;
 float baselineSum = 0;
 float currentTilt = 0;
 float tiltChange = 0;
+float slopeAngle = NAN;
 
 int baselineSamples = 0;
 
@@ -149,9 +138,9 @@ float vibration = 0;
 int vibrationHeldLevel = 0;
 unsigned long lastVibrationEvent = 0;
 
-// ==========================================
+// =====================================
 // TOF VARIABLES
-// ==========================================
+// =====================================
 
 float tofDistance = NAN;
 float tofBaseline = NAN;
@@ -159,9 +148,9 @@ float displacement = NAN;
 
 bool tofBaselineReady = false;
 
-// ==========================================
+// =====================================
 // TINYML VARIABLES
-// ==========================================
+// =====================================
 
 float previousMoisture = 0;
 float previousTilt = 0;
@@ -171,16 +160,21 @@ float previousDisplacement = 0;
 bool previousValid = false;
 int prediction = -1;
 
-// Timing
 unsigned long lastMPUSample = 0;
 unsigned long lastReport = 0;
 unsigned long previousReport = 0;
+unsigned long lastWifiAttempt = 0;
+unsigned long lastMqttAttempt = 0;
 
-// ==========================================
+bool buzzerState = false;
+
+// =====================================
 // OUTPUT HELPERS
-// ==========================================
+// =====================================
 
 void setBuzzer(bool on) {
+  buzzerState = on;
+
   digitalWrite(
     BUZZER_PIN,
     on
@@ -205,9 +199,9 @@ const char* riskName(int value) {
   }
 }
 
-// ==========================================
+// =====================================
 // MPU6050
-// ==========================================
+// =====================================
 
 bool writeMPU(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(MPU_ADDR);
@@ -220,13 +214,11 @@ bool readMPU(float &angle, float &deviationG) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);
 
-  if (Wire.endTransmission(false) != 0) {
+  if (Wire.endTransmission(false) != 0)
     return false;
-  }
 
-  if (Wire.requestFrom((int)MPU_ADDR, 14, true) != 14) {
+  if (Wire.requestFrom((int)MPU_ADDR, 14, true) != 14)
     return false;
-  }
 
   int16_t axRaw =
     (int16_t)((Wire.read() << 8) | Wire.read());
@@ -237,9 +229,8 @@ bool readMPU(float &angle, float &deviationG) {
   int16_t azRaw =
     (int16_t)((Wire.read() << 8) | Wire.read());
 
-  for (int i = 0; i < 8; i++) {
+  for (int i = 0; i < 8; i++)
     Wire.read();
-  }
 
   float ax = axRaw / 16384.0f;
   float ay = ayRaw / 16384.0f;
@@ -262,9 +253,8 @@ bool readMPU(float &angle, float &deviationG) {
 void sampleMPU() {
   unsigned long now = millis();
 
-  if (now - lastMPUSample < MPU_INTERVAL) {
+  if (now - lastMPUSample < MPU_INTERVAL)
     return;
-  }
 
   lastMPUSample = now;
 
@@ -274,9 +264,8 @@ void sampleMPU() {
   mpuSampleValid =
     mpuReady && readMPU(angle, deviation);
 
-  if (!mpuSampleValid) {
+  if (!mpuSampleValid)
     return;
-  }
 
   currentTilt = angle;
 
@@ -285,7 +274,9 @@ void sampleMPU() {
     baselineSamples++;
 
     if (baselineSamples >= 100) {
-      baselineTilt = baselineSum / baselineSamples;
+      baselineTilt =
+        baselineSum / baselineSamples;
+
       baselineReady = true;
 
       Serial.print("MPU baseline: ");
@@ -295,20 +286,20 @@ void sampleMPU() {
     return;
   }
 
-  if (deviation > vibrationPeak) {
+  if (deviation > vibrationPeak)
     vibrationPeak = deviation;
-  }
 }
 
-// ==========================================
+// =====================================
 // ADS1115 MOISTURE
-// ==========================================
+// =====================================
 
 float readMedianADC(uint8_t channel) {
   int16_t samples[5];
 
   for (int i = 0; i < 5; i++) {
-    samples[i] = ads.readADC_SingleEnded(channel);
+    samples[i] =
+      ads.readADC_SingleEnded(channel);
     delay(3);
   }
 
@@ -331,9 +322,8 @@ float calculateMoisture(float raw, int index) {
   float denominator =
     DRY_ADC[index] - WET_ADC[index];
 
-  if (!isfinite(raw) || denominator <= 0) {
+  if (!isfinite(raw) || denominator <= 0)
     return NAN;
-  }
 
   float percent =
     100.0f *
@@ -407,7 +397,6 @@ void updateMoisture() {
   float maximum = 0;
 
   for (int i = 0; i < 3; i++) {
-
     if (
       !filterReady[i] ||
       !isfinite(filteredADC[i]) ||
@@ -431,13 +420,11 @@ void updateMoisture() {
 
     sum += moisture[i];
 
-    if (moisture[i] < minimum) {
+    if (moisture[i] < minimum)
       minimum = moisture[i];
-    }
 
-    if (moisture[i] > maximum) {
+    if (moisture[i] > maximum)
       maximum = moisture[i];
-    }
   }
 
   if (!readingsUsable) {
@@ -451,7 +438,6 @@ void updateMoisture() {
 
   averageMoisture = sum / 3.0f;
   moistureRange = maximum - minimum;
-
   moistureDisplayReady = true;
 
   if (lowSignalWarning) {
@@ -459,7 +445,6 @@ void updateMoisture() {
     moistureValid = false;
   } else {
     goodFrames++;
-
     moistureValid =
       goodFrames >= RECOVERY_FRAMES;
   }
@@ -471,15 +456,13 @@ void updateMoisture() {
   }
 
   if (!moistureAlarm) {
-    if (averageMoisture >= MOISTURE_ON) {
+    if (averageMoisture >= MOISTURE_ON)
       wetFrames++;
-    } else {
+    else
       wetFrames = 0;
-    }
 
-    if (wetFrames >= ALARM_CONFIRM_FRAMES) {
+    if (wetFrames >= ALARM_CONFIRM_FRAMES)
       moistureAlarm = true;
-    }
   } else {
     if (averageMoisture < MOISTURE_OFF) {
       moistureAlarm = false;
@@ -488,17 +471,16 @@ void updateMoisture() {
   }
 }
 
-// ==========================================
+// =====================================
 // VL53L0X DISPLACEMENT
-// ==========================================
+// =====================================
 
 void updateToF() {
   tofDistance = NAN;
   displacement = NAN;
 
-  if (!tofReady) {
+  if (!tofReady)
     return;
-  }
 
   VL53L0X_RangingMeasurementData_t measurement;
   tof.rangingTest(&measurement, false);
@@ -520,9 +502,9 @@ void updateToF() {
   displacement = tofDistance - tofBaseline;
 }
 
-// ==========================================
+// =====================================
 // TINYML INFERENCE
-// ==========================================
+// =====================================
 
 void updatePrediction() {
   prediction = -1;
@@ -563,9 +545,8 @@ void updatePrediction() {
       (vibration - previousVibration) / dt;
   }
 
-  // Exact 11-feature interface of the existing model.
-  // Rainfall fields are compatibility placeholders,
-  // not actual rainfall measurements.
+  // Existing model's 11-feature interface.
+  // Rainfall fields are placeholders.
   float features[11] = {
     5.0f,
     averageMoisture,
@@ -590,25 +571,46 @@ void updatePrediction() {
   previousValid = true;
 }
 
-// ==========================================
-// MOVEMENT WARNINGS
-// ==========================================
+// =====================================
+// NEW SLOPE MOVEMENT LOGIC
+// =====================================
 
 int getMovementLevel() {
   if (!baselineReady || !mpuSampleValid) {
+    slopeAngle = NAN;
     return 0;
   }
 
-  tiltChange = fabsf(currentTilt - baselineTilt);
+  tiltChange =
+    fabsf(currentTilt - baselineTilt);
+
+  // Startup slope assumed to be 52.5 degrees.
+  // This is an estimated physical slope angle.
+  slopeAngle =
+    SLOPE_REST_DEG +
+    (currentTilt - baselineTilt);
+
+  float outsideBand = 0;
+
+  if (slopeAngle < SLOPE_NORMAL_MIN_DEG) {
+    outsideBand =
+      SLOPE_NORMAL_MIN_DEG - slopeAngle;
+  } else if (
+    slopeAngle > SLOPE_NORMAL_MAX_DEG
+  ) {
+    outsideBand =
+      slopeAngle - SLOPE_NORMAL_MAX_DEG;
+  }
 
   int tiltLevel = 0;
-  int vibrationLevel = 0;
 
-  if (tiltChange >= TILT_HIGH_DEG) {
+  if (outsideBand >= SLOPE_HIGH_EXCESS_DEG) {
     tiltLevel = 2;
-  } else if (tiltChange >= TILT_WARNING_DEG) {
+  } else if (outsideBand > 0) {
     tiltLevel = 1;
   }
+
+  int vibrationLevel = 0;
 
   if (vibration >= VIB_HIGH_G) {
     vibrationLevel = 2;
@@ -633,104 +635,96 @@ int getMovementLevel() {
   return max(tiltLevel, vibrationHeldLevel);
 }
 
-// ==========================================
-// STATUS AND ALERTS
-// ==========================================
+// =====================================
+// STATUS
+// =====================================
 
 const char* getStatus(int movementLevel) {
-  if (!moistureDisplayReady) {
+  if (!moistureDisplayReady)
     return "MOISTURE READ ERROR";
-  }
 
-  if (lowSignalWarning) {
-    return "LOW ADC SIGNAL";
-  }
-
-  if (!moistureValid) {
-    return "SENSOR STABILIZING";
-  }
-
-  if (moistureAlarm) {
+  // A genuine high-moisture condition should
+  // still take priority over the low-ADC flag.
+  if (
+    isfinite(averageMoisture) &&
+    averageMoisture >= MOISTURE_ON
+  ) {
     return "HIGH MOISTURE ALERT";
   }
 
-  if (!baselineReady) {
+  if (lowSignalWarning)
+    return "LOW ADC SIGNAL";
+
+  if (!moistureValid)
+    return "SENSOR STABILIZING";
+
+  if (moistureAlarm)
+    return "HIGH MOISTURE ALERT";
+
+  if (!baselineReady)
     return "CALIBRATING MPU";
-  }
 
-  if (!mpuSampleValid) {
+  if (!mpuSampleValid)
     return "MPU SENSOR FAULT";
-  }
 
-  if (movementLevel == 2) {
-    return "SLOPE MOVEMENT";
-  }
-
-  if (movementLevel == 1) {
-    return "MOVEMENT WARNING";
-  }
-
-  if (prediction == 0) {
+  if (prediction == 0)
     return "ML CRITICAL";
-  }
 
-  if (prediction == 1) {
+  if (prediction == 1)
     return "ML HIGH RISK";
-  }
 
-  if (prediction == 3) {
+  if (movementLevel == 2)
+    return "SLOPE MOVEMENT";
+
+  if (movementLevel == 1)
+    return "MOVEMENT WARNING";
+
+  if (prediction == 3)
     return "ML MODERATE";
-  }
 
   return "SYSTEM NORMAL";
 }
 
+// =====================================
+// RGB AND BUZZER
+// =====================================
 
 void updateOutputs(int movementLevel) {
-
-  // Moisture buzzer override:
-  // Trigger even when RAW ADC is below 1500,
-  // provided a numerical moisture reading exists.
   bool highMoisture =
     moistureDisplayReady &&
     isfinite(averageMoisture) &&
     averageMoisture >= 95.0f;
 
+  // Buzzer activates even if raw ADC < 1500.
   setBuzzer(highMoisture);
 
   if (highMoisture) {
     setRGB(true, false, false);
-  }
-  else if (!moistureValid) {
+  } else if (!moistureValid) {
     setRGB(false, false, true);
-  }
-  else if (
+  } else if (
     movementLevel == 2 ||
     prediction == 0 ||
     prediction == 1
   ) {
     setRGB(true, false, false);
-  }
-  else if (
+  } else if (
     movementLevel == 1 ||
     prediction == 3
   ) {
     setRGB(true, true, false);
-  }
-  else {
+  } else {
     setRGB(false, true, false);
   }
 }
 
-
-// ==========================================
+// =====================================
 // OLED DASHBOARD
-// ==========================================
+// =====================================
 
 void drawOLED(const char* status) {
-  if (!oledReady) {
+  if (!oledReady)
     return;
-  }
 
   display.clearDisplay();
   display.setTextSize(1);
@@ -753,18 +747,21 @@ void drawOLED(const char* status) {
     display.print(averageMoisture, 1);
     display.print("%");
 
-    if (!moistureValid) {
+    if (!moistureValid)
       display.print("*");
-    }
   } else {
     display.print("N/A");
   }
 
   display.setCursor(0, 24);
-  display.print("TILT     ");
+  display.print("SLOPE    ");
 
-  if (baselineReady && mpuSampleValid) {
-    display.print(tiltChange, 1);
+  if (
+    baselineReady &&
+    mpuSampleValid &&
+    isfinite(slopeAngle)
+  ) {
+    display.print(slopeAngle, 1);
     display.print(" deg");
   } else {
     display.print("CAL / N/A");
@@ -791,38 +788,39 @@ void drawOLED(const char* status) {
   display.setTextColor(SSD1306_BLACK);
   display.setCursor(2, 55);
 
-  if (!moistureDisplayReady) {
-    display.print("MOISTURE READ ERROR");
-  } else if (lowSignalWarning) {
-    display.print("LOW ADC - CHECK");
-  } else if (!moistureValid) {
-    display.print("STABILIZING...");
-  } else if (moistureAlarm) {
-    display.print("HIGH MOISTURE ALERT");
-  } else if (!baselineReady) {
-    display.print("CALIBRATING...");
-  } else if (!mpuSampleValid) {
-    display.print("MPU SENSOR FAULT");
-  } else if (tiltChange >= TILT_HIGH_DEG) {
-    display.print("TILT ALERT");
-  } else if (tiltChange >= TILT_WARNING_DEG) {
-    display.print("TILT WARNING");
-  } else if (vibrationHeldLevel > 0) {
-    display.print("VIBRATION DETECTED");
-  } else if (prediction == 0) {
-    display.print("ML CRITICAL RISK");
-  } else if (prediction == 1) {
-    display.print("ML HIGH RISK");
+  // Shorten messages for the 128px OLED.
+  if (strcmp(status, "HIGH MOISTURE ALERT") == 0) {
+    display.print("HIGH MOISTURE");
+  } else if (
+    strcmp(status, "SENSOR STABILIZING") == 0
+  ) {
+    display.print("STABILIZING");
+  } else if (
+    strcmp(status, "CALIBRATING MPU") == 0
+  ) {
+    display.print("CALIBRATING");
+  } else if (
+    strcmp(status, "MOVEMENT WARNING") == 0
+  ) {
+    display.print("MOVEMENT WARN");
+  } else if (
+    strcmp(status, "SLOPE MOVEMENT") == 0
+  ) {
+    display.print("SLOPE MOVEMENT");
+  } else if (
+    strcmp(status, "SYSTEM NORMAL") == 0
+  ) {
+    display.print("SYSTEM NORMAL");
   } else {
-    display.print("MONITORING ACTIVE");
+    display.print(status);
   }
 
   display.display();
 }
 
-// ==========================================
+// =====================================
 // SERIAL DIAGNOSTICS
-// ==========================================
+// =====================================
 
 void printDiagnostics(const char* status) {
   Serial.println();
@@ -853,28 +851,17 @@ void printDiagnostics(const char* status) {
       ) {
         Serial.print(" [LOW ADC]");
       }
-
-      Serial.println();
     } else {
-      Serial.println("N/A");
-    }
-  }
-
-  Serial.print("Average moisture: ");
-
-  if (moistureDisplayReady) {
-    Serial.print(averageMoisture, 1);
-    Serial.print("%");
-
-    if (!moistureValid) {
-      Serial.print(
-        lowSignalWarning
-          ? " [LOW ADC]"
-          : " [STABILIZING]"
-      );
+      Serial.print("N/A");
     }
 
     Serial.println();
+  }
+
+  Serial.print("Average moisture: ");
+  if (isfinite(averageMoisture)) {
+    Serial.print(averageMoisture, 1);
+    Serial.println("%");
   } else {
     Serial.println("N/A");
   }
@@ -894,6 +881,9 @@ void printDiagnostics(const char* status) {
   Serial.print("Tilt change: ");
   Serial.println(tiltChange, 2);
 
+  Serial.print("Estimated slope angle: ");
+  Serial.println(slopeAngle, 2);
+
   Serial.print("Vibration: ");
   Serial.println(vibration, 3);
 
@@ -910,32 +900,25 @@ void printDiagnostics(const char* status) {
   Serial.println(status);
 
   Serial.print("Buzzer: ");
-  Serial.println(moistureAlarm ? "ON" : "OFF");
-
-  if (lowSignalWarning) {
-    Serial.println(
-      "WARNING: ADC BELOW 1500 - CHECK SENSOR SIGNAL"
-    );
-  }
+  Serial.println(buzzerState ? "ON" : "OFF");
 
   Serial.println(
     "Experimental prototype - not field validated."
   );
 }
 
-// ==========================================
+// =====================================
 // WIFI AND MQTT
-// ==========================================
+// =====================================
 
 void startWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
   lastWifiAttempt = millis();
 
-  Serial.println(
-    "Wi-Fi: attempting hotspot connection..."
-  );
+  Serial.println("Wi-Fi: connecting...");
 }
 
 void maintainNetwork() {
@@ -950,6 +933,7 @@ void maintainNetwork() {
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
       Serial.println("Wi-Fi: retrying...");
     }
+
     return;
   }
 
@@ -964,11 +948,6 @@ void maintainNetwork() {
 
       clientId.replace(":", "");
 
-      Serial.print("MQTT: connecting to ");
-      Serial.print(MQTT_HOST);
-      Serial.print(":");
-      Serial.println(MQTT_PORT);
-
       if (
         mqttClient.connect(
           clientId.c_str(),
@@ -982,11 +961,16 @@ void maintainNetwork() {
         Serial.println(mqttClient.state());
       }
     }
+
     return;
   }
 
   mqttClient.loop();
 }
+
+// =====================================
+// JSON TELEMETRY
+// =====================================
 
 void appendJsonFloat(
   String &payload,
@@ -1005,18 +989,16 @@ void appendJsonFloat(
     payload += "null";
   }
 
-  if (comma) {
+  if (comma)
     payload += ",";
-  }
 }
 
 void publishTelemetry(
   const char* status,
   int movementLevel
 ) {
-  if (!mqttClient.connected()) {
+  if (!mqttClient.connected())
     return;
-  }
 
   String payload;
   payload.reserve(768);
@@ -1031,32 +1013,45 @@ void publishTelemetry(
   appendJsonFloat(
     payload, "moisture1", moisture[0], 2
   );
+
   appendJsonFloat(
     payload, "moisture2", moisture[1], 2
   );
+
   appendJsonFloat(
     payload, "moisture3", moisture[2], 2
   );
+
   appendJsonFloat(
     payload, "average_moisture",
     averageMoisture, 2
   );
+
   appendJsonFloat(
     payload, "moisture_range",
     moistureRange, 2
   );
+
   appendJsonFloat(
     payload, "tilt",
     tiltChange, 2
   );
+
+  appendJsonFloat(
+    payload, "slope_angle",
+    slopeAngle, 2
+  );
+
   appendJsonFloat(
     payload, "vibration",
     vibration, 4
   );
+
   appendJsonFloat(
     payload, "displacement",
     displacement, 2
   );
+
   appendJsonFloat(
     payload, "tof_distance",
     tofDistance, 2
@@ -1087,7 +1082,7 @@ void publishTelemetry(
   payload += ",";
 
   payload += "\"buzzer\":";
-  payload += moistureAlarm ? "true" : "false";
+  payload += buzzerState ? "true" : "false";
   payload += ",";
 
   payload += "\"status\":\"";
@@ -1101,16 +1096,16 @@ void publishTelemetry(
     payload.c_str()
   );
 
-  if (sent) {
-    Serial.println("MQTT: telemetry published");
-  } else {
-    Serial.println("MQTT: publish failed");
-  }
+  Serial.println(
+    sent
+      ? "MQTT: telemetry published"
+      : "MQTT: publish failed"
+  );
 }
 
-// ==========================================
+// =====================================
 // SETUP
-// ==========================================
+// =====================================
 
 void setup() {
   Serial.begin(115200);
@@ -1129,9 +1124,8 @@ void setup() {
 
   adsReady = ads.begin(0x48);
 
-  if (adsReady) {
+  if (adsReady)
     ads.setGain(GAIN_ONE);
-  }
 
   mpuReady = writeMPU(0x6B, 0x00);
 
@@ -1171,9 +1165,7 @@ void setup() {
   }
 
   Serial.println();
-  Serial.println(
-    "LANDSLIDEGUARD EXHIBITION START"
-  );
+  Serial.println("LANDSLIDEGUARD START");
 
   Serial.print("ADS1115: ");
   Serial.println(adsReady ? "READY" : "FAILED");
@@ -1188,7 +1180,7 @@ void setup() {
   Serial.println(oledReady ? "READY" : "FAILED");
 
   Serial.println(
-    "Keep MPU and ToF target stationary during startup."
+    "Keep slope at 52.5 deg during startup."
   );
 
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
@@ -1201,29 +1193,26 @@ void setup() {
   delay(1000);
 }
 
-// ==========================================
+// =====================================
 // MAIN LOOP
-// ==========================================
+// =====================================
 
 void loop() {
   sampleMPU();
-
   maintainNetwork();
 
   unsigned long now = millis();
 
-  if (now - lastReport < REPORT_INTERVAL) {
+  if (now - lastReport < REPORT_INTERVAL)
     return;
-  }
 
   lastReport = now;
 
   updateMoisture();
 
   if (baselineReady && mpuSampleValid) {
-    tiltChange = fabsf(
-      currentTilt - baselineTilt
-    );
+    tiltChange =
+      fabsf(currentTilt - baselineTilt);
   } else {
     tiltChange = 0;
   }
